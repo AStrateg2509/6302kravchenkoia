@@ -93,6 +93,23 @@ class Artwork(ABC):
         """Статический метод для преобразования в uint8."""
         return np.clip(img, 0, 255).astype(np.uint8)
 
+    @staticmethod
+    def _convolution_manual(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+        """Ручная реализация свертки."""
+        from numpy.lib.stride_tricks import as_strided
+
+        h, w = img.shape
+        kh, kw = kernel.shape
+        pad_h, pad_w = kh // 2, kw // 2
+
+        padded = np.pad(img, ((pad_h, pad_h), (pad_w, pad_w)), mode='constant')
+
+        shape = (h, w, kh, kw)
+        strides = padded.strides * 2
+        windows = as_strided(padded, shape=shape, strides=strides)
+
+        return np.tensordot(windows, kernel, axes=([2, 3], [0, 1]))
+
 
 class ColorArtwork(Artwork):
     """
@@ -149,23 +166,6 @@ class ColorArtwork(Artwork):
 
         new_metadata = {**self._metadata, 'converted_to': 'grayscale'}
         return GrayscaleArtwork(gray, new_metadata)
-
-    @staticmethod
-    def _convolution_manual(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-        """Ручная реализация свертки."""
-        from numpy.lib.stride_tricks import as_strided
-
-        h, w = img.shape
-        kh, kw = kernel.shape
-        pad_h, pad_w = kh // 2, kw // 2
-
-        padded = np.pad(img, ((pad_h, pad_h), (pad_w, pad_w)), mode='constant')
-
-        shape = (h, w, kh, kw)
-        strides = padded.strides * 2
-        windows = as_strided(padded, shape=shape, strides=strides)
-
-        return np.tensordot(windows, kernel, axes=([2, 3], [0, 1]))
 
 
 class GrayscaleArtwork(Artwork):
@@ -231,23 +231,6 @@ class GrayscaleArtwork(Artwork):
     def has_edges(self) -> bool:
         """Свойство, показывающее, выделены ли границы."""
         return self._is_edge_detected
-
-    @staticmethod
-    def _convolution_manual(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-        """Ручная реализация свертки."""
-        from numpy.lib.stride_tricks import as_strided
-
-        h, w = img.shape
-        kh, kw = kernel.shape
-        pad_h, pad_w = kh // 2, kw // 2
-
-        padded = np.pad(img, ((pad_h, pad_h), (pad_w, pad_w)), mode='constant')
-
-        shape = (h, w, kh, kw)
-        strides = padded.strides * 2
-        windows = as_strided(padded, shape=shape, strides=strides)
-
-        return np.tensordot(windows, kernel, axes=([2, 3], [0, 1]))
 
     def to_color_artwork(self) -> 'ColorArtwork':
         """Преобразование в 3-x канальное."""

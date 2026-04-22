@@ -10,7 +10,7 @@ import matplotlib.ticker as mticker
 import seaborn as sns
 from scipy import stats as scipy_stats
 from scipy.ndimage import uniform_filter1d
-from typing import Generator, Tuple
+from typing import Generator, Tuple, Hashable
 from pathlib import Path
 import warnings
 
@@ -236,7 +236,7 @@ class MetAnalyzer:
         return fig
 
 
-    def find_most_modern_country(self, min_objects: int = 10) -> Tuple[str, float]:
+    def find_most_modern_country(self, min_objects: int = 10) -> tuple[Hashable, float]:
         if self._data.empty:
             self._data = self._pipeline.run()
 
@@ -246,19 +246,24 @@ class MetAnalyzer:
             .agg(mean_date='mean', n='count')
         )
         means_s: pd.Series = agg.loc[agg['n'] >= min_objects, 'mean_date']
-        country = str(means_s.idxmax())
+        country = means_s.idxmax()
         return country, float(means_s.max())
 
 
     def plot_temporal_trend(
-            self, country: str, window_size: int = 15, bin_width: int = 10
+            self, country: str, window_size: int = 15, bin_width: int = 2
     ) -> plt.Figure:
+        # мне нужно по-другому получить все объекты конкретной страны
+        country = 'United States'
+
         dates: pd.Series = (
             self._data[self._data['Country'] == country]['Object Begin Date']
             .astype(float)
             .sort_values()
             .reset_index(drop=True)
         )
+
+        # print(dates.shape)
 
         lo   = int(np.floor(dates.min() / bin_width) * bin_width)
         hi   = int(np.ceil(dates.max() / bin_width) * bin_width) + bin_width
@@ -272,6 +277,8 @@ class MetAnalyzer:
         )
 
         fig, ax = plt.subplots(figsize=(14, 6))
+        ax.bar(centers, hist_s, width=1 * 0.9,
+               alpha=0.45, color='red', label='Объектов за период')
         ax.bar(centers, hist_s, width=bin_width * 0.9,
                alpha=0.45, color='steelblue', label='Объектов за период')
         ax.plot(centers, smooth, 'r-', linewidth=2,
@@ -588,7 +595,7 @@ def main() -> None:
     modern_country, avg_year = analyzer.find_most_modern_country()
     print(f"\nСамая «современная» страна: {modern_country}  (средний год: {avg_year:.0f})")
 
-    analyzer.plot_temporal_trend(modern_country, window_size=15, bin_width=10)
+    analyzer.plot_temporal_trend(modern_country, window_size=5, bin_width=10)
 
 
     print("\n" + "=" * 80)

@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metetl-kravchenko-6302"
+version = "0.1.0"
+description = "MET ETL: prepare/process/analyze MetObjects.csv with async download and parallel convolution"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Ivan Kravchenko, group 6302" }]
+license = { text = "MIT" }
+keywords = ["met", "etl", "image-processing", "convolution"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Operating System :: OS Independent",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+    "aiohttp>=3.9",
+    "aiofiles>=23",
+    "numpy>=1.26",
+    "opencv-python>=4.8",
+    "pandas>=2.1",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = ["build", "pytest", "twine"]
+
+[project.scripts]
+metetl = "metetl.cli:main"
+
+[project.urls]
+Homepage = "https://example.invalid/metetl-kravchenko-6302"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"metetl.images.c_ext" = ["*.c"]

@@ -1,10 +1,56 @@
-from typing import Optional, Tuple, Dict, Any
-import numpy as np
-import cv2
+from typing import Optional, Tuple, Dict, Any, List
+import asyncio
+import csv
+import os
+import random
+import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
+import aiofiles
+import aiohttp
+import cv2
+import numpy as np
 
 from artwork import Artwork, GrayscaleArtwork, ColorArtwork
 from decor import timeit
+
+
+def _convolve_in_process(payload: Tuple[int, str, bytes]) -> Tuple[int, str, bytes]:
+    """
+    Worker для ProcessPoolExecutor: декодирует PNG, применяет ручную свёртку
+    с гауссовым ядром, возвращает PNG-байты результата. Должна быть на уровне
+    модуля, иначе её нельзя пиклить для дочернего процесса.
+    """
+    idx, painting_id, png_bytes = payload
+    pid = os.getpid()
+    print(f"[LOG] Convolution for image {idx} started (PID {pid})", flush=True)
+
+    arr = np.frombuffer(png_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError(f"image {idx}: failed to decode PNG in worker")
+
+    size, sigma = 5, 1.0
+    ax = np.linspace(-(size // 2), size // 2, size)
+    xx, yy = np.meshgrid(ax, ax)
+    kernel = np.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
+    kernel /= kernel.sum()
+
+    if img.ndim == 3 and img.shape[2] == 3:
+        artwork: Artwork = ColorArtwork(img, {"painting_id": painting_id})
+    else:
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        artwork = GrayscaleArtwork(img, {"painting_id": painting_id})
+
+    processed = artwork.apply_filter(kernel)
+
+    ok, encoded = cv2.imencode('.png', processed.image)
+    if not ok:
+        raise RuntimeError(f"image {idx}: failed to encode PNG in worker")
+    print(f"[LOG] Convolution for image {idx} finished (PID {pid})", flush=True)
+    return idx, painting_id, bytes(encoded)
 
 
 class ImageProcessor:
@@ -327,3 +373,257 @@ class ImageProcessor:
                 # Для цветных складываем с копией
                 blended = artwork + artwork
                 print(f"  Сложение изображений: {blended.dimensions}")
+
+    # ------------------------------------------------------------------
+    # Lab 4: асинхронная загрузка + параллельная свёртка
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_painting_ids(csv_path: str) -> List[str]:
+        """Возвращает список Object ID всех записей с Classification='Paintings'."""
+        ids: List[str] = []
+        path = Path(csv_path)
+        if not path.exists():
+            print(f"[ERROR] Файл {csv_path} не найден", flush=True)
+            return ids
+        with open(path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("Classification") == "Paintings":
+                    object_id = row.get('Object ID')
+                    if object_id:
+                        ids.append(object_id)
+        print(f"[LOG] В CSV найдено {len(ids)} картин", flush=True)
+        return ids
+
+    async def _fetch_image_url(self, session: aiohttp.ClientSession,
+                                idx: int, painting_id: str) -> Optional[str]:
+        """Достать primaryImage URL из MET API."""
+        api_url = f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{painting_id}"
+        try:
+            async with session.get(api_url) as resp:
+                if resp.status != 200:
+                    print(f"[WARN] Image {idx}: API HTTP {resp.status} for {painting_id}", flush=True)
+                    return None
+                data = await resp.json()
+        except Exception as exc:
+            print(f"[WARN] Image {idx}: API error for {painting_id}: {exc}", flush=True)
+            return None
+        url = data.get("primaryImage")
+        if not url:
+            print(f"[WARN] Image {idx}: no primaryImage for {painting_id}", flush=True)
+            return None
+        return url
+
+    async def _download_and_save_original(self, idx: int, painting_id: str,
+                                            image_url: str,
+                                            session: aiohttp.ClientSession,
+                                            subdir: Path) -> Optional[bytes]:
+        """Скачать байты картинки и сохранить как PNG через aiofiles."""
+        print(f"[LOG] Downloading image {idx} started", flush=True)
+        try:
+            async with session.get(image_url) as resp:
+                if resp.status != 200:
+                    print(f"[ERROR] Image {idx}: HTTP {resp.status}", flush=True)
+                    return None
+                raw_bytes = await resp.read()
+        except Exception as exc:
+            print(f"[ERROR] Image {idx}: download failed: {exc}", flush=True)
+            return None
+
+        arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            print(f"[ERROR] Image {idx}: decode failed", flush=True)
+            return None
+        ok, encoded = cv2.imencode('.png', img)
+        if not ok:
+            print(f"[ERROR] Image {idx}: PNG encode failed", flush=True)
+            return None
+        png_bytes = bytes(encoded)
+
+        original_path = subdir / f"{idx}_{painting_id}_original.png"
+        async with aiofiles.open(original_path, 'wb') as f:
+            await f.write(png_bytes)
+        print(f"[LOG] Downloading image {idx} finished -> {original_path.name}", flush=True)
+        return png_bytes
+
+    @staticmethod
+    async def _save_processed(idx: int, painting_id: str,
+                                png_bytes: bytes, subdir: Path) -> None:
+        """Сохранить результат свёртки через aiofiles."""
+        path = subdir / f"{idx}_{painting_id}_processed.png"
+        async with aiofiles.open(path, 'wb') as f:
+            await f.write(png_bytes)
+        print(f"[LOG] Saving processed image {idx} finished -> {path.name}", flush=True)
+
+    async def _process_one(self, idx: int, painting_id: str,
+                            session: aiohttp.ClientSession,
+                            subdir: Path,
+                            executor: ProcessPoolExecutor) -> bool:
+        """Полный конвейер для одного изображения: API -> download -> conv -> save."""
+        image_url = await self._fetch_image_url(session, idx, painting_id)
+        if not image_url:
+            return False
+
+        png_bytes = await self._download_and_save_original(
+            idx, painting_id, image_url, session, subdir)
+        if png_bytes is None:
+            return False
+
+        loop = asyncio.get_running_loop()
+        try:
+            out_idx, out_id, out_bytes = await loop.run_in_executor(
+                executor, _convolve_in_process, (idx, painting_id, png_bytes))
+        except Exception as exc:
+            print(f"[ERROR] Image {idx}: convolution failed: {exc}", flush=True)
+            return False
+
+        await self._save_processed(out_idx, out_id, out_bytes, subdir)
+        return True
+
+    async def run_pipeline(self, csv_path: str, count: int) -> Tuple[int, Path]:
+        """
+        Главный конвейер Lab 4. Формирует список из count картин с фиксированными
+        порядковыми номерами, далее асинхронно скачивает их и параллельно
+        обрабатывает свёрткой в отдельных процессах.
+        """
+        ids = self._load_painting_ids(csv_path)
+        if not ids:
+            print("[ERROR] Список картин пуст", flush=True)
+            return 0, self._input_dir
+        if count > len(ids):
+            print(f"[WARN] Запрошено {count}, в CSV всего {len(ids)} - усечём", flush=True)
+            count = len(ids)
+
+        random.shuffle(ids)
+        selected = ids[:count]
+        # Порядковые номера фиксируются здесь и больше не меняются
+        indexed = list(enumerate(selected, start=1))
+        print(f"[LOG] Сформирован список URL: " +
+              ", ".join(f"{i}->{pid}" for i, pid in indexed), flush=True)
+
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        subdir = self._input_dir / f"run_{timestamp}"
+        subdir.mkdir(parents=True, exist_ok=True)
+        print(f"[LOG] Поддиректория для результатов: {subdir}", flush=True)
+
+        with ProcessPoolExecutor() as executor:
+            async with aiohttp.ClientSession() as session:
+                tasks = [self._process_one(idx, pid, session, subdir, executor)
+                         for idx, pid in indexed]
+                results = await asyncio.gather(*tasks)
+
+        success = sum(1 for r in results if r)
+        print(f"[LOG] Конвейер завершён: успешно {success}/{count}", flush=True)
+        return success, subdir
+
+    # ------------------------------------------------------------------
+    # Lab 4 (бонус): пайплайн на асинхронных генераторах.
+    # Скачивание -> свёртка -> сохранение. Каждый этап - отдельный
+    # async-генератор; стадии не блокируют друг друга, элементы текут
+    # через пайплайн по мере готовности.
+    # ------------------------------------------------------------------
+
+    async def _download_stage(self, indexed: List[Tuple[int, str]],
+                                session: aiohttp.ClientSession,
+                                subdir: Path):
+        """Этап 1: скачивает все картинки параллельно, yield-ит по мере готовности."""
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def one(idx: int, pid: str) -> None:
+            url = await self._fetch_image_url(session, idx, pid)
+            if not url:
+                return
+            png = await self._download_and_save_original(idx, pid, url, session, subdir)
+            if png is not None:
+                await queue.put((idx, pid, png))
+
+        async def producer() -> None:
+            await asyncio.gather(*(one(i, p) for i, p in indexed))
+            await queue.put(None)
+
+        prod_task = asyncio.create_task(producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+        finally:
+            await prod_task
+
+    async def _convolve_stage(self, source, executor: ProcessPoolExecutor):
+        """Этап 2: для каждого пришедшего элемента стартует свёртку в пуле
+        процессов и yield-ит результат по мере готовности (не дожидаясь
+        окончания всего входного потока)."""
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        collectors: List[asyncio.Task] = []
+
+        async def feeder() -> None:
+            async for item in source:
+                fut = loop.run_in_executor(executor, _convolve_in_process, item)
+
+                async def collect(f=fut) -> None:
+                    try:
+                        result = await f
+                    except Exception as exc:
+                        idx = item[0]
+                        print(f"[ERROR] Image {idx}: convolution failed: {exc}", flush=True)
+                        return
+                    await queue.put(result)
+
+                collectors.append(asyncio.create_task(collect()))
+            if collectors:
+                await asyncio.gather(*collectors, return_exceptions=True)
+            await queue.put(None)
+
+        feeder_task = asyncio.create_task(feeder())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+        finally:
+            await feeder_task
+
+    async def _save_stage(self, source, subdir: Path):
+        """Этап 3: сохраняет каждый пришедший результат через aiofiles
+        и yield-ит индекс/id по мере записи."""
+        async for idx, pid, png_bytes in source:
+            await self._save_processed(idx, pid, png_bytes, subdir)
+            yield idx, pid
+
+    async def run_pipeline_streaming(self, csv_path: str, count: int) -> Tuple[int, Path]:
+        """Главный конвейер на async-генераторах (бонус)."""
+        ids = self._load_painting_ids(csv_path)
+        if not ids:
+            print("[ERROR] Список картин пуст", flush=True)
+            return 0, self._input_dir
+        if count > len(ids):
+            print(f"[WARN] Запрошено {count}, в CSV всего {len(ids)} - усечём", flush=True)
+            count = len(ids)
+
+        random.shuffle(ids)
+        selected = ids[:count]
+        indexed = list(enumerate(selected, start=1))
+        print(f"[LOG] Сформирован список URL: " +
+              ", ".join(f"{i}->{pid}" for i, pid in indexed), flush=True)
+
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        subdir = self._input_dir / f"run_{timestamp}_streaming"
+        subdir.mkdir(parents=True, exist_ok=True)
+        print(f"[LOG] Поддиректория для результатов: {subdir}", flush=True)
+
+        success = 0
+        with ProcessPoolExecutor() as executor:
+            async with aiohttp.ClientSession() as session:
+                downloads = self._download_stage(indexed, session, subdir)
+                convolutions = self._convolve_stage(downloads, executor)
+                async for _idx, _pid in self._save_stage(convolutions, subdir):
+                    success += 1
+
+        print(f"[LOG] Streaming-конвейер завершён: успешно {success}/{count}", flush=True)
+        return success, subdir

@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Optional
 
-LOGGER_NAME = "metetl"
-DEFAULT_LOG_FILE = Path("logs") / "metetl.log"
+_CFG_PATH = Path(__file__).with_name("logging_config.json")
 
-_FILE_FORMAT = "%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s"
-_CONSOLE_FORMAT = "%(levelname)s %(message)s"
+with open(_CFG_PATH, encoding="utf-8") as _f:
+    _CFG = json.load(_f)
+
+LOGGER_NAME = _CFG["logger_name"]
+DEFAULT_LOG_FILE = Path(_CFG["default_log_file"])
+
+_FILE_FORMAT = _CFG["file_format"]
+_CONSOLE_FORMAT = _CFG["console_format"]
 
 _configured = False
 

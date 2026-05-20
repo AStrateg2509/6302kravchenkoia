@@ -1,6 +1,33 @@
 {
-  "logger_name": "metetl",
-  "default_log_file": "logs/metetl.log",
-  "file_format": "%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s",
-  "console_format": "%(levelname)s %(message)s"
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "file": {
+      "format": "%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s"
+    },
+    "console": {
+      "format": "%(levelname)s %(message)s"
+    }
+  },
+  "handlers": {
+    "file": {
+      "class": "logging.FileHandler",
+      "level": "DEBUG",
+      "formatter": "file",
+      "filename": "logs/metetl.log",
+      "encoding": "utf-8"
+    },
+    "console": {
+      "class": "logging.StreamHandler",
+      "level": "INFO",
+      "formatter": "console"
+    }
+  },
+  "loggers": {
+    "metetl": {
+      "level": "DEBUG",
+      "handlers": ["file", "console"],
+      "propagate": false
+    }
+  }
 }

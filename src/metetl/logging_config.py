@@ -32,6 +32,7 @@ def configure(log_file: Optional[Path] = None, console_level: int = logging.INFO
     log_path = Path(cfg["handlers"]["file"]["filename"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Ну собственно здесь
     logging.config.dictConfig(cfg)
 
     _configured = True
